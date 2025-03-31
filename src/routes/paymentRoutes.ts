@@ -28,7 +28,7 @@ router.post(
   async (req: IdempotentRequest, res: Response) => {
     try {
       console.log(req.body, "req body in payments");
-      const { amount, currency, customerId } = req.body as PaymentRequest;
+      const { amount, currency } = req.body as PaymentRequest;
       const paymentId = uuidv4();
 
       // Fetch account details from Wise
@@ -50,7 +50,7 @@ router.post(
         Number(process.env.WISE_PROFILE_ID)
       );
 
-      console.log(quote, "quote from wise");
+      //   console.log(quote, "quote from wise");
 
       // Store payment in database
       await paymentsCollection.insertOne({
@@ -80,11 +80,20 @@ router.post(
 
       // Store request and response for idempotency
       const response: PaymentResponse = { paymentId, status: "processing" };
-      await requestsCollection.insertOne({
-        idempotencyKey: req.idempotencyKey as string,
-        response,
-        createdAt: new Date()
-      });
+      try {
+        console.log(
+          `Storing request with idempotency key: ${req.idempotencyKey}`
+        );
+        const result = await requestsCollection.insertOne({
+          idempotencyKey: req.idempotencyKey as string,
+          response,
+          createdAt: new Date()
+        });
+        console.log(`Request stored with ID: ${result.insertedId}`);
+      } catch (dbError) {
+        console.error("Failed to store request in database:", dbError);
+        // Continue with the response even if storage fails
+      }
 
       res.status(202).json(response);
     } catch (error) {
