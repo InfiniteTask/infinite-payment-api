@@ -11,6 +11,7 @@ import * as amqp from "amqplib";
 import { MongoClient, Collection, Db, ObjectId } from "mongodb";
 import cors from "cors";
 import dotenv from "dotenv";
+import fetch from "node-fetch"; // Import node-fetch
 
 dotenv.config();
 // Types
@@ -39,7 +40,7 @@ interface PaymentEvent {
     amount: number;
     currency: string;
     customerId: string;
-    stripePaymentId: string;
+    wisePaymentId: string;
     status: string;
   };
 }
@@ -61,6 +62,27 @@ interface StoredEvent {
   processed?: boolean;
 }
 
+interface RecipientRequest {
+  name: string;
+  accountNumber: string;
+  ifscCode: string;
+  email: string;
+  customerId: string;
+  wiseProfileId?: number; // now this is created by us
+  wiseAccountId?: number; // We might not have it yet
+  currency: string; // Add currency
+  // Profile Data
+  firstName: string;
+  lastName: string;
+  addressFirstLine: string;
+  city: string;
+  countryIso3Code: string;
+  postCode: string;
+  stateCode: string;
+  nationality: string;
+  dateOfBirth: string;
+}
+
 // MongoDB connection
 const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017";
 const DB_NAME = "payments";
@@ -69,6 +91,12 @@ let db: Db;
 let requestsCollection: Collection<StoredRequest>;
 let eventsCollection: Collection<StoredEvent>;
 let paymentsCollection: Collection;
+let recipientsCollection: Collection; // Added recipients collection
+
+// Wise API Keys (replace with your actual API key and profile ID)
+const WISE_API_KEY = process.env.WISE_API_KEY;
+const WISE_PROFILE_ID = process.env.WISE_PROFILE_ID;
+const WISE_API_URL = process.env.WISE_API_URL;
 
 async function connectToMongoDB() {
   try {
@@ -80,10 +108,20 @@ async function connectToMongoDB() {
     requestsCollection = db.collection("requests");
     eventsCollection = db.collection("events");
     paymentsCollection = db.collection("payments");
+    recipientsCollection = db.collection("recipients"); // Initialize recipients collection
 
     // Create indexes for faster queries
     await requestsCollection.createIndex(
       { idempotencyKey: 1 },
+      { unique: true }
+    );
+    await recipientsCollection.createIndex({ customerId: 1 }); // Index for recipients
+    await recipientsCollection.createIndex(
+      { wiseAccountId: 1 },
+      { unique: true }
+    );
+    await recipientsCollection.createIndex(
+      { wiseProfileId: 1 },
       { unique: true }
     );
 
@@ -213,24 +251,52 @@ app.post(
   idempotencyMiddleware,
   async (req: IdempotentRequest, res: Response) => {
     try {
+      console.log(req.body, "req body in payments");
       const { amount, currency, customerId } = req.body as PaymentRequest;
       const paymentId = uuidv4();
 
-      // Mock Stripe API call
-      const paymentIntent = await mockStripePayment(
-        amount,
-        currency,
-        customerId
+      const fetchedAccountDetails = await fetch(
+        `${WISE_API_URL}/v1/profiles/${WISE_PROFILE_ID}/account-details`,
+        {
+          headers: {
+            Authorization: `Bearer ${WISE_API_KEY}`
+          }
+        }
       );
+      const accountDetailsData: any = await fetchedAccountDetails.json();
+      console.log(accountDetailsData, "account details data in payments");
+      const fetchedRecipients = await fetch(
+        `${WISE_API_URL}/v2/accounts?profile=${WISE_PROFILE_ID}&currency=INR`,
+        {
+          headers: {
+            Authorization: `Bearer ${WISE_API_KEY}`
+          }
+        }
+      );
+      const recipientsData: any = await fetchedRecipients.json();
+      console.log(recipientsData, "recipients data");
+      if (recipientsData.length === 0) {
+        throw new Error("No recipients found");
+      }
+      // Mock Stripe API call - REPLACED with Wise Quote
+      const quote = await getWiseQuote(
+        currency,
+        "INR",
+        amount,
+        recipientsData.content[0].id,
+        Number(WISE_PROFILE_ID)
+      );
+
+      console.log(quote, "quote from wise");
 
       // Store payment in database
       await paymentsCollection.insertOne({
         paymentId,
         amount,
         currency,
-        customerId,
-        stripePaymentId: paymentIntent.id,
-        status: paymentIntent.status,
+        customerId: recipientsData.content[0].id,
+        wisePaymentId: quote.id, // Storing quote ID
+        status: "succeeded", // Assuming quote retrieval means success
         createdAt: new Date()
       });
 
@@ -241,9 +307,9 @@ app.post(
           paymentId,
           amount,
           currency,
-          customerId,
-          stripePaymentId: paymentIntent.id,
-          status: paymentIntent.status
+          customerId: recipientsData.content[0].id,
+          wisePaymentId: quote.id, // Quote ID
+          status: "succeeded"
         }
       };
 
@@ -303,22 +369,72 @@ app.get("/api/events", async (req: Request, res: Response) => {
   }
 });
 
-// Mock Stripe API call
-async function mockStripePayment(
-  amount: number,
-  currency: string,
-  customerId: string
-): Promise<PaymentIntent> {
-  console.log(
-    `Creating payment of ${amount} ${currency} for customer ${customerId}`
-  );
-  return {
-    id: "pi_" + uuidv4().replace(/-/g, ""),
-    status: "succeeded",
-    amount,
-    currency
-  };
+async function getWiseQuote(
+  sourceCurrency: string,
+  targetCurrency: string,
+  sourceAmount: number,
+  targetAccount: number,
+  profileId: number
+): Promise<any> {
+  try {
+    const requestBody = {
+      sourceCurrency: sourceCurrency,
+      targetCurrency: targetCurrency,
+      sourceAmount: sourceAmount,
+      targetAmount: null,
+      payOut: null,
+      preferredPayIn: null,
+      targetAccount: targetAccount,
+      paymentMetadata: {
+        transferNature: "USD_TO_INR_PAYOUT"
+      }
+    };
+
+    const response = await fetch(
+      `${WISE_API_URL}/v3/profiles/${profileId}/quotes`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${WISE_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(requestBody)
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("Wise API Response (Quote):", response.status, errorText);
+      throw new Error(
+        `Wise API Error (Quote): ${response.status} ${response.statusText} - ${errorText}`
+      );
+    }
+
+    const data = await response.json();
+    console.log("Quote received from Wise:", data);
+    return data;
+  } catch (error) {
+    console.error("Error getting Wise quote:", error);
+    throw error;
+  }
 }
+
+// Mock Stripe API call - REPLACED by Wise Quote
+// async function mockStripePayment(
+//   amount: number,
+//   currency: string,
+//   customerId: string
+// ): Promise<PaymentIntent> {
+//   console.log(
+//     `Creating payment of ${amount} ${currency} for customer ${customerId}`
+//   );
+//   return {
+//     id: "pi_" + uuidv4().replace(/-/g, ""),
+//     status: "succeeded",
+//     amount,
+//     currency
+//   };
+// }
 
 // Connect to databases before starting the server
 async function startServer() {
